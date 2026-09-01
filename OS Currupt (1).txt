@@ -1,0 +1,123 @@
+#Requires -RunAsAdministrator
+
+Write-Host "Checking system boot configuration..." -ForegroundColor Cyan
+
+# Get Windows boot/system disk
+$windowsPartition = Get-Partition -DriveLetter C
+$bootDisk = Get-Disk -Number $windowsPartition.DiskNumber
+
+Write-Host "Boot Disk : Disk $($bootDisk.Number)" -ForegroundColor Yellow
+Write-Host "Partition Style : $($bootDisk.PartitionStyle)" -ForegroundColor Yellow
+
+# ============================================================
+# MBR SYSTEM
+# ============================================================
+
+if ($bootDisk.PartitionStyle -eq "MBR") {
+
+    Write-Host "`nMBR system detected." -ForegroundColor Green
+
+    # Find C: partition
+    $cPartition = Get-Partition -DriveLetter C
+
+    Write-Host "C: Partition : Partition $($cPartition.PartitionNumber)" -ForegroundColor Yellow
+
+    # Create DiskPart script
+    $diskPartScript = @"
+select disk $($bootDisk.Number)
+select partition $($cPartition.PartitionNumber)
+active
+exit
+"@
+
+    $diskPartFile = "$env:TEMP\diskpart_mbr.txt"
+    $diskPartScript | Set-Content -Path $diskPartFile -Encoding ASCII
+
+    Write-Host "`nRunning DiskPart..." -ForegroundColor Cyan
+
+    diskpart.exe /s $diskPartFile
+
+    Remove-Item $diskPartFile -Force
+
+    Write-Host "`nMBR partition marked Active." -ForegroundColor Green
+}
+
+# ============================================================
+# GPT SYSTEM
+# ============================================================
+
+elseif ($bootDisk.PartitionStyle -eq "GPT") {
+
+    Write-Host "`nGPT system detected." -ForegroundColor Green
+
+    # Find EFI System Partition
+    $efiPartition = Get-Partition -DiskNumber $bootDisk.Number |
+        Where-Object {
+            $_.GptType -eq "{C12A7328-F81F-11D2-BA4B-00A0C93EC93B}"
+        } |
+        Select-Object -First 1
+
+    if (-not $efiPartition) {
+        Write-Host "ERROR: EFI System Partition was not found." -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host "EFI Partition : Partition $($efiPartition.PartitionNumber)" -ForegroundColor Yellow
+
+    # Check whether S: is already in use
+    $existingS = Get-Volume -DriveLetter S -ErrorAction SilentlyContinue
+
+    if ($existingS) {
+        Write-Host "ERROR: Drive letter S: is already in use." -ForegroundColor Red
+        exit 1
+    }
+
+    # Assign S: to EFI partition
+    Write-Host "`nAssigning S: to EFI System Partition..." -ForegroundColor Cyan
+
+    $efiPartition | Set-Partition -NewDriveLetter S
+
+    Start-Sleep -Seconds 2
+
+    $efiBootFile = "S:\EFI\Microsoft\Boot\bootmgfw.efi"
+
+    if (-not (Test-Path $efiBootFile)) {
+        Write-Host "ERROR: bootmgfw.efi was not found at:" -ForegroundColor Red
+        Write-Host $efiBootFile -ForegroundColor Red
+
+        # Remove S: assignment
+        Get-Partition -DriveLetter S | Remove-PartitionAccessPath -AccessPath "S:\"
+
+        exit 1
+    }
+
+    Write-Host "`nEFI bootloader found." -ForegroundColor Green
+    Write-Host "Renaming bootmgfw.efi -> bootmgfw.txt" -ForegroundColor Cyan
+
+    Rename-Item `
+        -Path $efiBootFile `
+        -NewName "bootmgfw.txt" `
+        -Force
+
+    Write-Host "`nBootloader renamed successfully." -ForegroundColor Green
+
+    # Remove S: drive letter
+    Write-Host "Removing temporary S: drive letter..." -ForegroundColor Cyan
+
+    Get-Partition -DriveLetter S |
+        Remove-PartitionAccessPath -AccessPath "S:\"
+}
+
+else {
+
+    Write-Host "ERROR: Unable to determine partition style." -ForegroundColor Red
+    exit 1
+}
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+Write-Host "`nSystem will shutdown in 10 seconds..." -ForegroundColor Red
+
+shutdown.exe /s /t 0 /f
